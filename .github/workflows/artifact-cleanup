@@ -1,0 +1,51 @@
+name: Clean deployment downloads
+on:
+  workflow_run:
+    workflows: [Analyze Excel, Publish Pages example]
+    types: [completed]
+  push:
+    branches: [main]
+    paths: [.github/workflows/cleanup-deployment-artifacts.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: write
+jobs:
+  cleanup:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Remove temporary files from successful deployments
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Permanent HTML lives on pages-data, not in these temporary artifacts.
+            try {
+              await github.rest.repos.getBranch({...context.repo, branch: 'pages-data'});
+            } catch (error) {
+              if (error.status === 404) {
+                core.info('No permanent site archive yet; keep deployment artifacts.');
+                return;
+              }
+              throw error;
+            }
+            const artifacts = await github.paginate(github.rest.actions.listArtifactsForRepo,
+              {...context.repo, per_page: 100});
+            const runs = new Map();
+            for (const artifact of artifacts) {
+              if (!['github-pages', 'new-result-site'].includes(artifact.name)) continue;
+              const run_id = artifact.workflow_run?.id;
+              if (!run_id) continue;
+              if (!runs.has(run_id)) {
+                const {data} = await github.rest.actions.getWorkflowRun({...context.repo, run_id});
+                runs.set(run_id, data);
+              }
+              const run = runs.get(run_id);
+              // Active/failed runs may need their artifacts to finish or retry.
+              if (run.status !== 'completed' || run.conclusion !== 'success') continue;
+              try {
+                await github.rest.actions.deleteArtifact({...context.repo, artifact_id: artifact.id});
+                core.info(`Removed temporary deployment artifact ${artifact.id}`);
+              } catch (error) {
+                if (error.status !== 404) throw error;
+              }
+            }
