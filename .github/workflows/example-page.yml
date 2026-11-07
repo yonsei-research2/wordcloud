@@ -5,7 +5,7 @@ on:
     branches: [main]
     paths:
       - data/example.xlsx
-      - .github/workflows/pages-example.yml
+      - .github/workflows/example-page.yml
   workflow_dispatch:
 
 permissions:
