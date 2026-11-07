@@ -1,0 +1,214 @@
+name: Analyze Excel
+run-name: Analyze ${{ inputs.input_path }} (${{ inputs.mode }})
+on:
+  workflow_dispatch:
+    inputs:
+      input_path:
+        description: '저장소 안 Excel 경로 (예: data/papers.xlsx)'
+        required: true
+        default: data/example.xlsx
+        type: string
+      mode:
+        description: 'sample: 최대 100건 / full: 전체'
+        type: choice
+        options: [sample, full]
+        default: sample
+      config_path:
+        description: '분석 설정 JSON 경로'
+        type: string
+        default: config.json
+      publish_pages:
+        description: '분석 HTML 화면을 GitHub Pages에 공개 게시 (ZIP·Excel 제외)'
+        type: boolean
+        default: true
+  workflow_call:
+    inputs:
+      input_path:
+        type: string
+        default: data/example.xlsx
+      mode:
+        type: string
+        default: sample
+      config_path:
+        type: string
+        default: config.json
+      publish_pages:
+        type: boolean
+        default: true
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+jobs:
+  analyze:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    outputs:
+      result_id: ${{ steps.result.outputs.id }}
+    env:
+      MPLBACKEND: Agg
+      INPUT_PATH: ${{ inputs.input_path }}
+      MODE: ${{ inputs.mode }}
+      CONFIG_PATH: ${{ inputs.config_path }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y fonts-nanum
+          python -m pip install -r requirements.txt
+      - name: Analyze
+        run: python run_analysis.py "$INPUT_PATH" --mode "$MODE" --config "$CONFIG_PATH"
+      - name: Downloadable results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: wordcloud-${{ inputs.mode }}-${{ github.run_id }}
+          path: output/${{ inputs.mode }}/
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Prepare HTML-only Pages site
+        if: inputs.publish_pages
+        run: python build_pages.py --mode "$MODE"
+      - name: Assign unique result link
+        if: inputs.publish_pages
+        id: result
+        run: |
+          python -c 'import os,uuid; open(os.environ["GITHUB_OUTPUT"],"a").write("id="+uuid.uuid4().hex+"\n")'
+      - name: Save new HTML result
+        if: inputs.publish_pages
+        uses: actions/upload-artifact@v4
+        with:
+          name: new-result-site
+          path: site/
+          retention-days: 2
+  publish:
+    if: inputs.publish_pages
+    needs: analyze
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          path: pages-store
+      - uses: actions/download-artifact@v4
+        with:
+          name: new-result-site
+          path: ${{ runner.temp }}/new-site
+      - name: Locate existing site on first migration
+        id: previous
+        uses: actions/github-script@v7
+        with:
+          script: |
+            try {
+              await github.rest.repos.getBranch({...context.repo, branch: 'pages-data'});
+              return;
+            } catch (error) { if (error.status !== 404) throw error; }
+            const runs = await github.paginate(github.rest.actions.listWorkflowRunsForRepo,
+              {...context.repo, status: 'success', per_page: 100});
+            for (const run of runs) {
+              if (!['Analyze Excel', 'Publish Pages example', 'Remove public downloads'].includes(run.name)) continue;
+              const {data} = await github.rest.actions.listWorkflowRunArtifacts({...context.repo, run_id: run.id});
+              if (data.artifacts.some(a => a.name === 'github-pages' && !a.expired)) {
+                core.setOutput('run_id', String(run.id));
+                return;
+              }
+            }
+            throw new Error('기존 화면을 보존할 Pages 아티팩트가 없습니다. 초기 이전이 필요합니다.');
+      - uses: actions/download-artifact@v4
+        if: steps.previous.outputs.run_id != ''
+        with:
+          name: github-pages
+          path: ${{ runner.temp }}/previous-site
+          run-id: ${{ steps.previous.outputs.run_id }}
+          github-token: ${{ github.token }}
+      - name: Preserve existing root page
+        if: steps.previous.outputs.run_id != ''
+        run: python sanitize_pages.py "$RUNNER_TEMP/previous-site/artifact.tar" --site-dir "$RUNNER_TEMP/bootstrap"
+      - name: Append result without replacing previous links
+        env:
+          RESULT_ID: ${{ needs.analyze.outputs.result_id }}
+        run: |
+          python publish_site.py --store pages-store --site "$RUNNER_TEMP/new-site" --result-id "$RESULT_ID" --bootstrap "$RUNNER_TEMP/bootstrap"
+  deploy:
+    if: inputs.publish_pages
+    needs: [analyze, publish]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    concurrency:
+      group: github-pages
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.link.outputs.url }}
+    steps:
+      # Read the latest accumulated branch AFTER acquiring the deployment slot.
+      - uses: actions/checkout@v4
+        with:
+          ref: pages-data
+          path: published-site
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: published-site/
+      - name: Deploy Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+      - name: Verify new and existing public results
+        uses: actions/github-script@v7
+        env:
+          BASE_URL: ${{ steps.deployment.outputs.page_url }}
+          RESULT_ID: ${{ needs.analyze.outputs.result_id }}
+        with:
+          script: |
+            const fs = require('fs');
+            const ids = fs.readdirSync('published-site/results').filter(id => /^[a-f0-9]{32}$/.test(id));
+            const id = process.env.RESULT_ID;
+            const paths = ['', `results/${id}/`, `results/${id}/paper_explorer_assets/data.js`,
+              `results/${id}/paper_explorer_assets/images.js`];
+            const older = ids.find(other => other !== id);
+            if (older) paths.push(`results/${older}/`);
+            let message = '';
+            for (let attempt = 0; attempt < 12; attempt++) {
+              const statuses = await Promise.all([...paths, `results/${id}/analysis.xlsx`,
+                `results/${id}/results.zip`].map(async path => {
+                  const url = new URL(path, process.env.BASE_URL);
+                  url.searchParams.set('verify', String(Date.now()));
+                  return (await fetch(url)).status;
+                }));
+              message = statuses.join(',');
+              if (statuses.slice(0, paths.length).every(s => s === 200) &&
+                  statuses.slice(paths.length).every(s => s === 404)) {
+                core.info(`Public links verified: ${message}`);
+                return;
+              }
+              await new Promise(resolve => setTimeout(resolve, 5000));
+            }
+            throw new Error(`Result verification failed: ${message}`);
+      - name: Show recipient link
+        id: link
+        env:
+          BASE_URL: ${{ steps.deployment.outputs.page_url }}
+          RESULT_ID: ${{ needs.analyze.outputs.result_id }}
+        run: |
+          echo "url=${BASE_URL%/}/results/$RESULT_ID/" >> "$GITHUB_OUTPUT"
+          echo "### 이용자에게 전달할 결과 링크" >> "$GITHUB_STEP_SUMMARY"
+          echo "${BASE_URL%/}/results/$RESULT_ID/" >> "$GITHUB_STEP_SUMMARY"
