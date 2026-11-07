@@ -1,0 +1,13 @@
+spacy==3.8.7
+https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
+konlpy==0.6.0
+pandas==2.2.3
+openpyxl==3.1.5
+tqdm==4.67.1
+pillow==11.2.1
+numpy==2.2.6
+matplotlib==3.10.3
+# Keep spaCy/Weasel CLI dependencies on a matching, click-based release.
+typer==0.15.4
+typer-slim==0.15.4
+click==8.1.8
