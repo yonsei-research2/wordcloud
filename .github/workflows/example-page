@@ -1,0 +1,239 @@
+name: Publish Pages example
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - data/example.xlsx
+      - .github/workflows/pages-example.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    env:
+      MPLBACKEND: Agg
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y fonts-nanum
+          python -m pip install -r requirements.txt
+
+      - name: Analyze example
+        run: python run_analysis.py data/example.xlsx --mode sample --config config.json
+
+      - name: Save downloadable results
+        uses: actions/upload-artifact@v4
+        with:
+          name: wordcloud-sample-${{ github.run_id }}
+          path: output/sample/
+          retention-days: 14
+
+      - name: Prepare HTML only
+        run: python build_pages.py --mode sample
+
+      - uses: actions/checkout@v4
+        with:
+          path: pages-store
+
+      - name: Update fixed example folder
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import shutil
+          import tempfile
+          from publish_site import copy_site, git
+
+          store = Path('pages-store').resolve()
+
+          with tempfile.TemporaryDirectory() as tmp:
+              staged = Path(tmp) / 'site'
+              copy_site(Path('site').resolve(), staged)
+
+              git(store, 'config', 'user.name', 'github-actions[bot]')
+              git(
+                  store, 'config', 'user.email',
+                  '41898282+github-actions[bot]@users.noreply.github.com'
+              )
+
+              for attempt in range(10):
+                  heads = git(
+                      store, 'ls-remote', '--heads',
+                      'origin', 'pages-data'
+                  )
+                  heads.check_returncode()
+                  remote = heads.stdout.strip()
+                  old = remote.split()[0] if remote else None
+
+                  if not old:
+                      raise RuntimeError(
+                          'pages-data 브랜치가 없습니다. '
+                          '기존 사이트의 초기 이전을 먼저 완료하세요.'
+                      )
+
+                  git(
+                      store, 'fetch', '--depth=1',
+                      'origin', 'pages-data'
+                  ).check_returncode()
+                  git(
+                      store, 'checkout', '-B',
+                      'pages-data', 'FETCH_HEAD'
+                  ).check_returncode()
+                  git(
+                      store, 'reset', '--hard', 'FETCH_HEAD'
+                  ).check_returncode()
+
+                  target = store / 'example'
+
+                  if target.is_symlink() or (
+                      target.exists() and not target.is_dir()
+                  ):
+                      raise ValueError(
+                          'example must be a regular directory'
+                      )
+
+                  if target.exists():
+                      shutil.rmtree(target)
+
+                  copy_site(staged, target)
+                  (store / '.nojekyll').touch()
+
+                  git(
+                      store, 'add', '--', 'example', '.nojekyll'
+                  ).check_returncode()
+
+                  diff = git(
+                      store, 'diff', '--cached', '--quiet',
+                      check=False
+                  )
+
+                  if diff.returncode == 0:
+                      break
+                  if diff.returncode != 1:
+                      diff.check_returncode()
+
+                  git(
+                      store, 'commit', '-m',
+                      'Update fixed example page'
+                  ).check_returncode()
+
+                  pushed = git(
+                      store, 'push', 'origin',
+                      'HEAD:refs/heads/pages-data',
+                      check=False
+                  )
+
+                  if pushed.returncode == 0:
+                      break
+
+                  current = git(
+                      store, 'ls-remote', '--heads',
+                      'origin', 'pages-data'
+                  )
+                  current.check_returncode()
+                  current_sha = (
+                      current.stdout.split()[0]
+                      if current.stdout.strip() else None
+                  )
+
+                  if current_sha == old:
+                      raise RuntimeError(
+                          'Example upload failed: ' + pushed.stderr
+                      )
+              else:
+                  raise RuntimeError(
+                      'Too many concurrent updates; retry this workflow'
+                  )
+          PY
+
+  deploy:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    concurrency:
+      group: github-pages
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.link.outputs.url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: pages-data
+          path: published-site
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: published-site/
+
+      - uses: actions/deploy-pages@v4
+        id: deployment
+
+      - name: Verify example
+        env:
+          BASE_URL: ${{ steps.deployment.outputs.page_url }}
+        run: |
+          python - <<'PY'
+          import os
+          import time
+          from urllib.request import urlopen
+
+          base = os.environ['BASE_URL'].rstrip('/') + '/example/'
+
+          for attempt in range(12):
+              try:
+                  for path in [
+                      '',
+                      'paper_explorer_assets/data.js',
+                      'paper_explorer_assets/images.js',
+                  ]:
+                      url = (
+                          base + path
+                          + '?verify=' + str(time.time_ns())
+                      )
+                      with urlopen(url, timeout=30) as response:
+                          if response.status != 200:
+                              raise RuntimeError(
+                                  'Example is not ready'
+                              )
+                  break
+              except Exception:
+                  if attempt == 11:
+                      raise
+                  time.sleep(5)
+          PY
+
+      - name: Show fixed example link
+        id: link
+        env:
+          BASE_URL: ${{ steps.deployment.outputs.page_url }}
+        run: |
+          url="${BASE_URL%/}/example/"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "### 예제 고정 주소" >> "$GITHUB_STEP_SUMMARY"
+          echo "$url" >> "$GITHUB_STEP_SUMMARY"
