@@ -127,7 +127,7 @@ jobs:
                 return;
               }
             }
-            throw new Error('기존 화면을 보존할 Pages 아티팩트가 없습니다. 초기 이전이 필요합니다.');
+            core.info('이전 게시 자료가 없어 새 사이트로 시작합니다.');
       - uses: actions/download-artifact@v4
         if: steps.previous.outputs.run_id != ''
         with:
@@ -142,7 +142,17 @@ jobs:
         env:
           RESULT_ID: ${{ needs.analyze.outputs.result_id }}
         run: |
-          python publish_site.py --store pages-store --site "$RUNNER_TEMP/new-site" --result-id "$RESULT_ID" --bootstrap "$RUNNER_TEMP/bootstrap"
+          args=(
+            --store pages-store
+            --site "$RUNNER_TEMP/new-site"
+            --result-id "$RESULT_ID"
+          )
+
+          if [ -f "$RUNNER_TEMP/bootstrap/index.html" ]; then
+            args+=(--bootstrap "$RUNNER_TEMP/bootstrap")
+          fi
+
+          python publish_site.py "${args[@]}"
   deploy:
     if: inputs.publish_pages
     needs: [analyze, publish]
